@@ -20,8 +20,10 @@ import {
   ComputerTool,
   FunctionTool,
   HostedMCPTool,
+  HostedTool,
   ShellTool,
   Tool,
+  type ToolAllowedCaller,
   getClientToolSearchExecutor,
   getToolSearchRuntimeToolKey,
 } from '../tool';
@@ -58,6 +60,7 @@ import {
   executeCustomClientToolSearch,
   getClientToolSearchHelper,
 } from './toolSearch';
+import { ensureToolCallerAllowed } from './toolCaller';
 
 function ensureToolAvailable<T>(
   tool: T | undefined,
@@ -74,9 +77,108 @@ function ensureToolAvailable<T>(
   return tool;
 }
 
+function ensureProgrammaticToolCallingAvailable<TContext>(
+  output: protocol.ProgramCallItem,
+  tools: Tool<TContext>[],
+  agent: Agent<any, any>,
+): void {
+  ensureToolAvailable(
+    tools.find(
+      (tool) =>
+        tool.type === 'hosted_tool' &&
+        tool.providerData?.type === 'programmatic_tool_calling',
+    ),
+    `Model produced a program item without programmaticToolCallingTool() in Agent (${agent.name}).`,
+    {
+      agent_name: agent.name,
+      tool_call_id: output.callId,
+    },
+  );
+}
+
+const MCP_HOSTED_CALL_TYPES = new Set([
+  'mcp_call',
+  'mcp_list_tools',
+  'mcp_approval_request',
+  'mcp_approval_response',
+]);
+
+function ensureHostedToolCallAllowed<TContext>(
+  output: protocol.HostedToolCallItem,
+  tools: Tool<TContext>[],
+  mcpToolMap: Map<string, HostedMCPTool>,
+  loadedToolNames: Set<string>,
+  agent: Agent<any, any>,
+): void {
+  const providerType = output.providerData?.type;
+  const isCodeInterpreterCall =
+    providerType === 'code_interpreter_call' ||
+    providerType === 'code_interpreter' ||
+    output.name === 'code_interpreter_call' ||
+    output.name === 'code_interpreter';
+  if (isCodeInterpreterCall) {
+    const codeInterpreterTool = tools.find(
+      (tool): tool is HostedTool =>
+        tool.type === 'hosted_tool' &&
+        tool.providerData?.type === 'code_interpreter',
+    );
+    if (!codeInterpreterTool) {
+      return;
+    }
+
+    ensureToolCallerAllowed(
+      output,
+      codeInterpreterTool.providerData?.allowed_callers,
+      codeInterpreterTool.name,
+      agent,
+    );
+    return;
+  }
+
+  if (
+    !MCP_HOSTED_CALL_TYPES.has(providerType) &&
+    !MCP_HOSTED_CALL_TYPES.has(output.name)
+  ) {
+    return;
+  }
+
+  const serverLabel = output.providerData?.server_label;
+  if (typeof serverLabel !== 'string') {
+    return;
+  }
+  const mcpTool = mcpToolMap.get(serverLabel);
+  if (!mcpTool) {
+    return;
+  }
+  ensureToolCallerAllowed(
+    output,
+    mcpTool.providerData.allowed_callers,
+    serverLabel,
+    agent,
+  );
+  if (
+    mcpTool.providerData.defer_loading !== true ||
+    loadedToolNames.has(serverLabel)
+  ) {
+    return;
+  }
+
+  const message = `Model produced deferred MCP call ${serverLabel} before it was loaded via tool_search.`;
+  addErrorToCurrentSpan({
+    message,
+    data: {
+      agent_name: agent.name,
+      mcp_server_label: serverLabel,
+      tool_call_id: output.id,
+    },
+  });
+  throw new ModelBehaviorError(message);
+}
+
 function handleToolCallAction<
   TTool extends {
     name: string;
+    allowedCallers?: readonly ToolAllowedCaller[];
   },
   TAction,
 >({
@@ -101,6 +203,12 @@ function handleToolCallAction<
   buildAction: (resolvedTool: TTool) => TAction;
 }) {
   const resolvedTool = ensureToolAvailable(tool, errorMessage, errorData);
+  ensureToolCallerAllowed(
+    output,
+    resolvedTool.allowedCallers,
+    resolvedTool.name,
+    agent,
+  );
   items.push(new RunToolCallItem(output, agent));
   toolsUsed.push(resolvedTool.name);
   actions.push(buildAction(resolvedTool));
@@ -737,7 +845,20 @@ export function processModelResponse<TContext>(
       addHostedMcpToolsFromToolSearchOutput(output, mcpToolMap, {
         preserveExistingServerLabels: originalMcpServerLabels,
       });
+    } else if (output.type === 'program') {
+      ensureProgrammaticToolCallingAvailable(output, tools, agent);
+      items.push(new RunToolCallItem(output, agent));
+      toolsUsed.push('programmatic_tool_calling');
+    } else if (output.type === 'program_output') {
+      items.push(new RunToolCallOutputItem(output, agent, output.output));
     } else if (output.type === 'hosted_tool_call') {
+      ensureHostedToolCallAllowed(
+        output,
+        tools,
+        mcpToolMap,
+        loadedDeferredToolState.loadedToolNames,
+        agent,
+      );
       items.push(new RunToolCallItem(output, agent));
       const toolName = output.name;
       toolsUsed.push(toolName);
@@ -760,7 +881,6 @@ export function processModelResponse<TContext>(
           });
           throw new ModelBehaviorError(message);
         }
-
         // Do this approval later:
         // We support both onApproval callback (like the Python SDK does) and HITL patterns.
         const approvalItem = new RunToolApprovalItem(
@@ -771,6 +891,7 @@ export function processModelResponse<TContext>(
             id: providerData.id,
             status: 'in_progress',
             providerData,
+            ...(output.caller ? { caller: output.caller } : {}),
           },
           agent,
         );
@@ -806,6 +927,12 @@ export function processModelResponse<TContext>(
         shellTool,
         'Model produced shell action without a shell tool.',
         { agent_name: agent.name },
+      );
+      ensureToolCallerAllowed(
+        output,
+        resolvedShellTool.allowedCallers,
+        resolvedShellTool.name,
+        agent,
       );
       items.push(new RunToolCallItem(output, agent));
       toolsUsed.push(resolvedShellTool.name);
@@ -883,6 +1010,12 @@ export function processModelResponse<TContext>(
         functionToolsNotFound,
       );
     } else if (resolved.type === 'handoff') {
+      ensureToolCallerAllowed(
+        output,
+        undefined,
+        resolved.handoff.toolName,
+        agent,
+      );
       recordHandoffRequest(
         output,
         resolved.handoff,
@@ -892,6 +1025,12 @@ export function processModelResponse<TContext>(
         runHandoffs,
       );
     } else {
+      ensureToolCallerAllowed(
+        output,
+        resolved.tool.allowedCallers,
+        getFunctionToolQualifiedName(resolved.tool) ?? resolved.tool.name,
+        agent,
+      );
       ensureDeferredFunctionToolLoaded(
         output,
         resolved.tool,
@@ -1064,7 +1203,20 @@ export async function processModelResponseAsync<TContext>(
       addHostedMcpToolsFromToolSearchOutput(output, mcpToolMap, {
         preserveExistingServerLabels: originalMcpServerLabels,
       });
+    } else if (output.type === 'program') {
+      ensureProgrammaticToolCallingAvailable(output, availableTools, agent);
+      items.push(new RunToolCallItem(output, agent));
+      toolsUsed.push('programmatic_tool_calling');
+    } else if (output.type === 'program_output') {
+      items.push(new RunToolCallOutputItem(output, agent, output.output));
     } else if (output.type === 'hosted_tool_call') {
+      ensureHostedToolCallAllowed(
+        output,
+        availableTools,
+        mcpToolMap,
+        loadedDeferredToolState.loadedToolNames,
+        agent,
+      );
       items.push(new RunToolCallItem(output, agent));
       const toolName = output.name;
       toolsUsed.push(toolName);
@@ -1086,7 +1238,6 @@ export async function processModelResponseAsync<TContext>(
           });
           throw new ModelBehaviorError(message);
         }
-
         const approvalItem = new RunToolApprovalItem(
           {
             type: 'hosted_tool_call',
@@ -1094,6 +1245,7 @@ export async function processModelResponseAsync<TContext>(
             id: providerData.id,
             status: 'in_progress',
             providerData,
+            ...(output.caller ? { caller: output.caller } : {}),
           },
           agent,
         );
@@ -1127,6 +1279,12 @@ export async function processModelResponseAsync<TContext>(
         shellTool,
         'Model produced shell action without a shell tool.',
         { agent_name: agent.name },
+      );
+      ensureToolCallerAllowed(
+        output,
+        resolvedShellTool.allowedCallers,
+        resolvedShellTool.name,
+        agent,
       );
       items.push(new RunToolCallItem(output, agent));
       toolsUsed.push(resolvedShellTool.name);
@@ -1200,6 +1358,12 @@ export async function processModelResponseAsync<TContext>(
         functionToolsNotFound,
       );
     } else if (resolved.type === 'handoff') {
+      ensureToolCallerAllowed(
+        output,
+        undefined,
+        resolved.handoff.toolName,
+        agent,
+      );
       recordHandoffRequest(
         output,
         resolved.handoff,
@@ -1209,6 +1373,12 @@ export async function processModelResponseAsync<TContext>(
         runHandoffs,
       );
     } else {
+      ensureToolCallerAllowed(
+        output,
+        resolved.tool.allowedCallers,
+        getFunctionToolQualifiedName(resolved.tool) ?? resolved.tool.name,
+        agent,
+      );
       ensureDeferredFunctionToolLoaded(
         output,
         resolved.tool,

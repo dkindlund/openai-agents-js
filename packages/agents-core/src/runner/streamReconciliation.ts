@@ -1,23 +1,28 @@
+import { randomUUID } from '@openai/agents-core/_shims';
+
 import type { ModelRequest, ModelResponse } from '../model';
 import type {
   FunctionCallItem,
   FunctionCallResultItem,
+  ProgramCallResultItem,
   StreamEvent,
 } from '../types/protocol';
 
 type PendingStreamedFunctionCall = Pick<
   FunctionCallItem,
-  'callId' | 'name' | 'namespace'
+  'callId' | 'name' | 'namespace' | 'caller'
 >;
 
 export type StreamAbortReconciliationState = {
   responseId?: string;
   pendingFunctionCalls: Map<string, PendingStreamedFunctionCall>;
+  pendingProgramCalls: Map<string, string>;
 };
 
 export function createStreamAbortReconciliationState(): StreamAbortReconciliationState {
   return {
     pendingFunctionCalls: new Map(),
+    pendingProgramCalls: new Map(),
   };
 }
 
@@ -27,6 +32,7 @@ export function recordStreamEventForAbortReconciliation(
 ): void {
   if (event.type === 'response_done') {
     state.pendingFunctionCalls.clear();
+    state.pendingProgramCalls.clear();
     state.responseId = event.response.id;
     return;
   }
@@ -46,6 +52,17 @@ export function recordStreamEventForAbortReconciliation(
   }
 
   if (
+    rawEvent.type === 'response.output_item.added' &&
+    isRecord(rawEvent.item) &&
+    rawEvent.item.type === 'program_output' &&
+    typeof rawEvent.item.call_id === 'string' &&
+    typeof rawEvent.item.id === 'string'
+  ) {
+    state.pendingProgramCalls.set(rawEvent.item.call_id, rawEvent.item.id);
+    return;
+  }
+
+  if (
     rawEvent.type !== 'response.output_item.done' ||
     !isRecord(rawEvent.item)
   ) {
@@ -53,6 +70,18 @@ export function recordStreamEventForAbortReconciliation(
   }
 
   const item = rawEvent.item;
+  if (item.type === 'program' && typeof item.call_id === 'string') {
+    if (!state.pendingProgramCalls.has(item.call_id)) {
+      state.pendingProgramCalls.set(item.call_id, generateProgramOutputId());
+    }
+    return;
+  }
+
+  if (item.type === 'program_output' && typeof item.call_id === 'string') {
+    state.pendingProgramCalls.delete(item.call_id);
+    return;
+  }
+
   if (item.type === 'function_call' && typeof item.call_id === 'string') {
     state.pendingFunctionCalls.set(item.call_id, {
       callId: item.call_id,
@@ -60,6 +89,18 @@ export function recordStreamEventForAbortReconciliation(
       ...(typeof item.namespace === 'string'
         ? { namespace: item.namespace }
         : {}),
+      ...(isRecord(item.caller) && item.caller.type === 'direct'
+        ? { caller: { type: 'direct' as const } }
+        : isRecord(item.caller) &&
+            item.caller.type === 'program' &&
+            typeof item.caller.caller_id === 'string'
+          ? {
+              caller: {
+                type: 'program' as const,
+                callerId: item.caller.caller_id,
+              },
+            }
+          : {}),
     });
     return;
   }
@@ -74,17 +115,33 @@ export function recordStreamEventForAbortReconciliation(
 
 export function buildAbortReconciliationInput(
   state: StreamAbortReconciliationState,
-): FunctionCallResultItem[] {
-  return Array.from(state.pendingFunctionCalls.values(), (toolCall) => ({
-    type: 'function_call_result',
-    name: toolCall.name,
-    ...(typeof toolCall.namespace === 'string'
-      ? { namespace: toolCall.namespace }
-      : {}),
-    callId: toolCall.callId,
-    status: 'incomplete',
-    output: { type: 'text', text: 'aborted' },
-  }));
+): (FunctionCallResultItem | ProgramCallResultItem)[] {
+  const functionOutputs = Array.from(
+    state.pendingFunctionCalls.values(),
+    (toolCall): FunctionCallResultItem => ({
+      type: 'function_call_result',
+      name: toolCall.name,
+      ...(typeof toolCall.namespace === 'string'
+        ? { namespace: toolCall.namespace }
+        : {}),
+      callId: toolCall.callId,
+      status: 'incomplete',
+      output: { type: 'text', text: 'aborted' },
+      ...(toolCall.caller ? { caller: toolCall.caller } : {}),
+    }),
+  );
+  const programOutputs = Array.from(
+    state.pendingProgramCalls,
+    ([callId, id]): ProgramCallResultItem => ({
+      type: 'program_output',
+      id,
+      callId,
+      status: 'incomplete',
+      output: 'aborted',
+    }),
+  );
+
+  return [...functionOutputs, ...programOutputs];
 }
 
 export function getAbortReconciliationPreviousResponseId(
@@ -100,7 +157,9 @@ export function getAbortReconciliationPreviousResponseId(
 export function shouldReconcileStreamAbort(
   state: StreamAbortReconciliationState,
 ): boolean {
-  return state.pendingFunctionCalls.size > 0;
+  return (
+    state.pendingFunctionCalls.size > 0 || state.pendingProgramCalls.size > 0
+  );
 }
 
 export function markAbortReconciliationComplete(
@@ -108,6 +167,7 @@ export function markAbortReconciliationComplete(
   response: ModelResponse | undefined,
 ): void {
   state.pendingFunctionCalls.clear();
+  state.pendingProgramCalls.clear();
   if (response?.responseId) {
     state.responseId = response.responseId;
   }
@@ -115,4 +175,8 @@ export function markAbortReconciliationComplete(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
+}
+
+function generateProgramOutputId(): string {
+  return `prog_out_${randomUUID().replace(/-/g, '')}`;
 }

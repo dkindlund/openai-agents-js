@@ -995,6 +995,247 @@ describe('RunState', () => {
     );
   });
 
+  it('round-trips Programmatic Tool Calling items in schema 1.14', async () => {
+    const context = new RunContext();
+    const agent = new Agent({ name: 'ProgramAgent' });
+    const program: protocol.ProgramCallItem = {
+      type: 'program',
+      id: 'prog_1',
+      callId: 'call_prog_1',
+      code: 'text("ok")',
+      fingerprint: 'fp_1',
+    };
+    const programOutput: protocol.ProgramCallResultItem = {
+      type: 'program_output',
+      id: 'prog_out_1',
+      callId: 'call_prog_1',
+      output: 'ok',
+      status: 'completed',
+    };
+    const state = new RunState(context, 'input', agent, 1);
+    state._generatedItems.push(
+      new RunToolCallItem(program, agent),
+      new RunToolCallOutputItem(programOutput, agent, programOutput.output),
+    );
+
+    const serialized = state.toJSON();
+    expect(serialized.$schemaVersion).toBe('1.14');
+    const restored = await RunState.fromString(
+      agent,
+      JSON.stringify(serialized),
+    );
+    expect(restored._generatedItems.map((item) => item.rawItem)).toEqual([
+      program,
+      programOutput,
+    ]);
+
+    serialized.$schemaVersion = '1.13';
+    await expect(
+      RunState.fromString(agent, JSON.stringify(serialized)),
+    ).rejects.toThrow('does not support Programmatic Tool Calling items');
+  });
+
+  it('rejects pre-1.14 state with program-owned hosted calls', async () => {
+    const agent = new Agent({ name: 'HostedProgramAgent' });
+    const hostedCall: protocol.HostedToolCallItem = {
+      type: 'hosted_tool_call',
+      id: 'ci_1',
+      name: 'code_interpreter_call',
+      status: 'completed',
+      caller: { type: 'program', callerId: 'call_prog_1' },
+      providerData: { type: 'code_interpreter_call' },
+    };
+    const state = new RunState(new RunContext(), 'input', agent, 1);
+    state._generatedItems.push(new RunToolCallItem(hostedCall, agent));
+
+    const restored = await RunState.fromString(agent, state.toString());
+    expect(restored._generatedItems[0].rawItem).toEqual(hostedCall);
+
+    const serialized = state.toJSON();
+    serialized.$schemaVersion = '1.13';
+
+    await expect(
+      RunState.fromString(agent, JSON.stringify(serialized)),
+    ).rejects.toThrow('does not support Programmatic Tool Calling items');
+  });
+
+  it('rechecks allowed callers against rebound tools during resume', async () => {
+    const caller = {
+      type: 'program' as const,
+      callerId: 'call_program',
+    };
+    const createProcessedResponse = (
+      overrides: Record<string, unknown>,
+    ): NonNullable<RunState<any, any>['_lastProcessedResponse']> =>
+      ({
+        newItems: [],
+        toolsUsed: [],
+        handoffs: [],
+        functions: [],
+        computerActions: [],
+        shellActions: [],
+        applyPatchActions: [],
+        mcpApprovalRequests: [],
+        hasToolsOrApprovalsToRun: () => true,
+        ...overrides,
+      }) as NonNullable<RunState<any, any>['_lastProcessedResponse']>;
+
+    const savedFunction = tool({
+      name: 'lookup',
+      description: 'Look up a value.',
+      parameters: z.object({}),
+      allowedCallers: ['programmatic'],
+      execute: async () => 'saved',
+    });
+    const functionCall: protocol.FunctionCallItem = {
+      type: 'function_call',
+      name: 'lookup',
+      callId: 'call_function',
+      arguments: '{}',
+      caller,
+    };
+    const savedFunctionAgent = new Agent({
+      name: 'FunctionResumeAgent',
+      tools: [savedFunction],
+    });
+    const functionState = new RunState(
+      new RunContext(),
+      'input',
+      savedFunctionAgent,
+      1,
+    );
+    functionState._lastProcessedResponse = createProcessedResponse({
+      functions: [{ toolCall: functionCall, tool: savedFunction }],
+    });
+
+    await expect(
+      RunState.fromString(savedFunctionAgent, functionState.toString()),
+    ).resolves.toBeInstanceOf(RunState);
+
+    const reboundFunctionAgent = new Agent({
+      name: 'FunctionResumeAgent',
+      tools: [
+        tool({
+          name: 'lookup',
+          description: 'Look up a value.',
+          parameters: z.object({}),
+          execute: async () => 'rebound',
+        }),
+      ],
+    });
+    await expect(
+      RunState.fromString(reboundFunctionAgent, functionState.toString()),
+    ).rejects.toThrow(/caller programmatic/);
+
+    const savedShell = shellTool({
+      shell: new FakeShell(),
+      allowedCallers: ['programmatic'],
+    });
+    const shellCall: protocol.ShellCallItem = {
+      type: 'shell_call',
+      callId: 'call_shell',
+      action: { commands: ['echo hi'] },
+      caller,
+    };
+    const savedShellAgent = new Agent({
+      name: 'ShellResumeAgent',
+      tools: [savedShell],
+    });
+    const shellState = new RunState(
+      new RunContext(),
+      'input',
+      savedShellAgent,
+      1,
+    );
+    shellState._lastProcessedResponse = createProcessedResponse({
+      shellActions: [{ toolCall: shellCall, shell: savedShell }],
+    });
+    const reboundShellAgent = new Agent({
+      name: 'ShellResumeAgent',
+      tools: [shellTool({ shell: new FakeShell() })],
+    });
+    await expect(
+      RunState.fromString(reboundShellAgent, shellState.toString()),
+    ).rejects.toThrow(/caller programmatic/);
+
+    const savedApplyPatch = applyPatchTool({
+      editor: new FakeEditor(),
+      allowedCallers: ['programmatic'],
+    });
+    const applyPatchCall: protocol.ApplyPatchCallItem = {
+      type: 'apply_patch_call',
+      callId: 'call_apply_patch',
+      status: 'completed',
+      operation: { type: 'delete_file', path: 'temp.txt' },
+      caller,
+    };
+    const savedApplyPatchAgent = new Agent({
+      name: 'ApplyPatchResumeAgent',
+      tools: [savedApplyPatch],
+    });
+    const applyPatchState = new RunState(
+      new RunContext(),
+      'input',
+      savedApplyPatchAgent,
+      1,
+    );
+    applyPatchState._lastProcessedResponse = createProcessedResponse({
+      applyPatchActions: [
+        { toolCall: applyPatchCall, applyPatch: savedApplyPatch },
+      ],
+    });
+    const reboundApplyPatchAgent = new Agent({
+      name: 'ApplyPatchResumeAgent',
+      tools: [applyPatchTool({ editor: new FakeEditor() })],
+    });
+    await expect(
+      RunState.fromString(reboundApplyPatchAgent, applyPatchState.toString()),
+    ).rejects.toThrow(/caller programmatic/);
+  });
+
+  it('accepts schema 1.13 application data that resembles PTC items', async () => {
+    const context = new RunContext({
+      nested: { type: 'program_output' },
+    });
+    context.toolInput = { type: 'program', callId: 'tool_input_program' };
+    const agent = new Agent({ name: 'ProgramLikeDataAgent' });
+    const state = new RunState(context, 'input', agent, 1);
+    const rawItem: protocol.FunctionCallResultItem = {
+      type: 'function_call_result',
+      name: 'lookup',
+      callId: 'call_program_like_data',
+      status: 'completed',
+      output: 'done',
+      providerData: {
+        nested: { type: 'program_output' },
+      },
+    };
+    state._generatedItems.push(
+      new RunToolCallOutputItem(rawItem, agent, 'done', {
+        nested: { type: 'program', callId: 'custom_data_program' },
+      }),
+    );
+
+    const serialized = state.toJSON();
+    serialized.$schemaVersion = '1.13';
+
+    const restored = await RunState.fromString(
+      agent,
+      JSON.stringify(serialized),
+    );
+
+    expect(restored._context.context).toEqual(context.context);
+    expect(restored._context.toolInput).toEqual(context.toolInput);
+    expect(restored._generatedItems[0].rawItem.providerData).toEqual(
+      rawItem.providerData,
+    );
+    expect(
+      (restored._generatedItems[0] as RunToolCallOutputItem).customData,
+    ).toEqual({
+      nested: { type: 'program', callId: 'custom_data_program' },
+    });
+  });
+
   it('throws error if schema version is missing or invalid', async () => {
     const context = new RunContext();
     const agent = new Agent({ name: 'Agent1' });
@@ -2717,6 +2958,10 @@ describe('deserialize helpers', () => {
               type: 'hosted_tool_call',
               name: 'fetch_generic_url_content',
               status: 'in_progress',
+              caller: {
+                type: 'program',
+                callerId: 'prog_approval_1',
+              },
               providerData: {
                 id: 'mcpr_685bc3c47ed88192977549b5206db77504d4306d5de6ab36',
                 type: 'mcp_approval_request',
@@ -2780,6 +3025,17 @@ describe('deserialize helpers', () => {
       state._lastProcessedResponse?.mcpApprovalRequests[0].requestItem.rawItem
         .providerData,
     );
+    const restoredApprovalRawItem =
+      restored._lastProcessedResponse?.mcpApprovalRequests[0].requestItem
+        .rawItem;
+    expect(restoredApprovalRawItem?.type).toBe('hosted_tool_call');
+    if (restoredApprovalRawItem?.type !== 'hosted_tool_call') {
+      throw new Error('Expected a hosted MCP approval item');
+    }
+    expect(restoredApprovalRawItem.caller).toEqual({
+      type: 'program',
+      callerId: 'prog_approval_1',
+    });
   });
 
   it('rejects resumed function tools when isEnabled is false in replacement context', async () => {
