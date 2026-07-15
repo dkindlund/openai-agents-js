@@ -165,6 +165,71 @@ describe('processModelResponse', () => {
     ).rejects.toThrow(/without programmaticToolCallingTool\(\)/);
   });
 
+  it('accepts program calls when a prompt may supply programmaticToolCallingTool in sync and async processing', async () => {
+    const programCall: protocol.ProgramCallItem = {
+      type: 'program',
+      id: 'prog_prompt_supplied',
+      callId: 'call_prog_prompt_supplied',
+      code: 'text("ok")',
+      fingerprint: 'fp_prompt_supplied',
+    };
+    const response: ModelResponse = {
+      output: [programCall],
+      usage: new Usage(),
+    };
+    const processingOptions = { allowPromptSuppliedTools: true };
+
+    const syncResult = processModelResponse(
+      response,
+      TEST_AGENT,
+      [],
+      [],
+      [],
+      'raise_error',
+      processingOptions,
+    );
+    expect(syncResult.toolsUsed).toEqual(['programmatic_tool_calling']);
+
+    const clientToolSearch = attachClientToolSearchExecutor(
+      {
+        type: 'hosted_tool',
+        name: 'tool_search',
+        providerData: {
+          type: 'tool_search',
+          execution: 'client',
+        },
+      },
+      async () => [],
+    );
+    const toolSearchCall: protocol.ToolSearchCallItem = {
+      type: 'tool_search_call',
+      id: 'ts_before_prompt_program',
+      status: 'completed',
+      arguments: { paths: [] },
+      providerData: {
+        call_id: 'call_ts_before_prompt_program',
+        execution: 'client',
+      },
+    };
+    const asyncResult = await processModelResponseAsync(
+      {
+        output: [toolSearchCall, programCall],
+        usage: new Usage(),
+      },
+      TEST_AGENT,
+      [clientToolSearch],
+      [],
+      new RunState(new RunContext(), 'hello', TEST_AGENT, 1),
+      [],
+      'raise_error',
+      processingOptions,
+    );
+    expect(asyncResult.toolsUsed).toEqual([
+      'tool_search',
+      'programmatic_tool_calling',
+    ]);
+  });
+
   it('rejects function and handoff calls from disallowed callers', () => {
     const programOnlyFunction = tool({
       name: 'program_only',

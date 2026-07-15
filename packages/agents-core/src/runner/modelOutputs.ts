@@ -81,13 +81,18 @@ function ensureProgrammaticToolCallingAvailable<TContext>(
   output: protocol.ProgramCallItem,
   tools: Tool<TContext>[],
   agent: Agent<any, any>,
+  options: ModelResponseProcessingOptions,
 ): void {
+  const programmaticTool = tools.find(
+    (tool) =>
+      tool.type === 'hosted_tool' &&
+      tool.providerData?.type === 'programmatic_tool_calling',
+  );
+  if (programmaticTool || options.allowPromptSuppliedTools === true) {
+    return;
+  }
   ensureToolAvailable(
-    tools.find(
-      (tool) =>
-        tool.type === 'hosted_tool' &&
-        tool.providerData?.type === 'programmatic_tool_calling',
-    ),
+    programmaticTool,
     `Model produced a program item without programmaticToolCallingTool() in Agent (${agent.name}).`,
     {
       agent_name: agent.name,
@@ -95,6 +100,10 @@ function ensureProgrammaticToolCallingAvailable<TContext>(
     },
   );
 }
+
+type ModelResponseProcessingOptions = {
+  allowPromptSuppliedTools?: boolean;
+};
 
 const MCP_HOSTED_CALL_TYPES = new Set([
   'mcp_call',
@@ -766,6 +775,7 @@ export function processModelResponse<TContext>(
   handoffs: Handoff<any, any>[],
   priorItems: Array<RunItem | AgentInputItem> = [],
   toolNotFoundBehavior: ToolNotFoundBehavior = 'raise_error',
+  processingOptions: ModelResponseProcessingOptions = {},
 ): ProcessedResponse<TContext> {
   const items: RunItem[] = [];
   const runHandoffs: ToolRunHandoff[] = [];
@@ -846,7 +856,12 @@ export function processModelResponse<TContext>(
         preserveExistingServerLabels: originalMcpServerLabels,
       });
     } else if (output.type === 'program') {
-      ensureProgrammaticToolCallingAvailable(output, tools, agent);
+      ensureProgrammaticToolCallingAvailable(
+        output,
+        tools,
+        agent,
+        processingOptions,
+      );
       items.push(new RunToolCallItem(output, agent));
       toolsUsed.push('programmatic_tool_calling');
     } else if (output.type === 'program_output') {
@@ -1086,6 +1101,7 @@ export async function processModelResponseAsync<TContext>(
   state: RunState<TContext, Agent<any, any>>,
   priorItems: Array<RunItem | AgentInputItem> = [],
   toolNotFoundBehavior: ToolNotFoundBehavior = 'raise_error',
+  processingOptions: ModelResponseProcessingOptions = {},
 ): Promise<ProcessedResponse<TContext>> {
   const clientToolSearchTool = getClientToolSearchHelper(tools);
   const hasCustomClientToolSearchExecutor = Boolean(
@@ -1106,6 +1122,7 @@ export async function processModelResponseAsync<TContext>(
       handoffs,
       priorItems,
       toolNotFoundBehavior,
+      processingOptions,
     );
   }
 
@@ -1204,7 +1221,12 @@ export async function processModelResponseAsync<TContext>(
         preserveExistingServerLabels: originalMcpServerLabels,
       });
     } else if (output.type === 'program') {
-      ensureProgrammaticToolCallingAvailable(output, availableTools, agent);
+      ensureProgrammaticToolCallingAvailable(
+        output,
+        availableTools,
+        agent,
+        processingOptions,
+      );
       items.push(new RunToolCallItem(output, agent));
       toolsUsed.push('programmatic_tool_calling');
     } else if (output.type === 'program_output') {

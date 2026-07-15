@@ -1161,6 +1161,102 @@ describe('Runner.run', () => {
       });
     });
 
+    it('accepts Programmatic Tool Calling supplied by a prompt template', async () => {
+      const lookup = tool({
+        name: 'prompt_lookup',
+        description: 'Return the requested key.',
+        parameters: z.object({ key: z.string() }),
+        allowedCallers: ['programmatic'],
+        outputSchema: {
+          type: 'object',
+          properties: { key: { type: 'string' } },
+          required: ['key'],
+          additionalProperties: false,
+        },
+        execute: async ({ key }) => ({ key }),
+      });
+      const agent = new Agent({
+        name: 'PromptProgramAgent',
+        model: new FakeModel([
+          {
+            output: [
+              {
+                type: 'program',
+                id: 'prog_prompt_supplied',
+                callId: 'call_prog_prompt_supplied',
+                code: 'text(await tools.prompt_lookup({key:"prompt"}))',
+                fingerprint: 'fp_prompt_supplied',
+              },
+              {
+                type: 'function_call',
+                id: 'fc_prompt_supplied',
+                callId: 'call_prompt_lookup',
+                name: 'prompt_lookup',
+                arguments: '{"key":"prompt"}',
+                caller: {
+                  type: 'program',
+                  callerId: 'call_prog_prompt_supplied',
+                },
+              },
+            ],
+            usage: new Usage(),
+          },
+          {
+            output: [
+              {
+                type: 'program_output',
+                id: 'prog_out_prompt_supplied',
+                callId: 'call_prog_prompt_supplied',
+                output: '{"key":"prompt"}',
+                status: 'completed',
+              },
+              fakeModelMessage('Prompt program completed.'),
+            ],
+            usage: new Usage(),
+          },
+        ]),
+        prompt: { promptId: 'pmpt_programmatic_tool_calling' },
+        tools: [lookup],
+      });
+
+      const result = await run(agent, 'Run the prompt program.');
+
+      expect(result.finalOutput).toBe('Prompt program completed.');
+      expect(result.newItems.map((item) => item.rawItem.type)).toEqual([
+        'program',
+        'function_call',
+        'function_call_result',
+        'program_output',
+        'message',
+      ]);
+    });
+
+    it('rejects prompt-supplied Programmatic Tool Calling when tools are explicitly disabled', async () => {
+      const agent = new Agent({
+        name: 'PromptProgramAgent',
+        model: new FakeModel([
+          {
+            output: [
+              {
+                type: 'program',
+                id: 'prog_prompt_disabled',
+                callId: 'call_prog_prompt_disabled',
+                code: 'text("blocked")',
+                fingerprint: 'fp_prompt_disabled',
+              },
+            ],
+            usage: new Usage(),
+          },
+        ]),
+        prompt: { promptId: 'pmpt_programmatic_tool_calling' },
+        tools: [],
+      });
+
+      await expect(run(agent, 'Run the prompt program.')).rejects.toThrow(
+        /without programmaticToolCallingTool\(\)/,
+      );
+    });
+
     it('sholuld handle structured output', async () => {
       const fakeModel = new FakeModel([
         {
